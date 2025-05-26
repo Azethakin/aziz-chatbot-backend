@@ -59,7 +59,7 @@ app.post('/chat', async (req, res) => {
             model,
             messages,
             temperature: 0.7,
-            stream: false
+            stream: allowStream
           })
 
         }),
