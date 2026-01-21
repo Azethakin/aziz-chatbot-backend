@@ -6,55 +6,47 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Middleware logs
-app.use((req, res, next) => {
+app.use((req, _res, next) => {
   const date = new Date().toISOString();
   console.log(`[${date}] ${req.method} ${req.url} - IP: ${req.ip}`);
   next();
 });
 
-// Rotation intelligente des clés
+// Petit healthcheck pour Render
+app.get("/healthz", (_req, res) => res.json({ ok: true }));
+
 let apiKeysStatus = [
   { name: "API_KEY_1", value: process.env.API_KEY_1, errors: 0 },
   { name: "API_KEY_2", value: process.env.API_KEY_2, errors: 0 },
   { name: "API_KEY_3", value: process.env.API_KEY_3, errors: 0 },
   { name: "API_KEY_4", value: process.env.API_KEY_4, errors: 0 },
-];
+].filter(k => !!k.value); // enlève les clés vides
 
 app.post("/chat", async (req, res) => {
-  const { model, messages } = req.body;
-
-  console.log("📥 MODEL reçu :", model);
-  console.log("📥 Messages reçus :", messages);
+  const { model, messages, temperature = 0.7 } = req.body;
 
   if (!model || typeof model !== "string") {
-    return res.status(400).json({ error: "Requête invalide : model manquant ou invalide." });
+    return res.status(400).json({ error: "Requête invalide : model manquant." });
   }
-
-  if (!messages || !Array.isArray(messages) || messages.length === 0) {
+  if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: "Requête invalide : aucun message fourni." });
+  }
+  if (apiKeysStatus.length === 0) {
+    return res.status(500).json({ error: "Aucune clé API disponible sur le serveur (variables d'environnement)." });
   }
 
   const timeoutMs = 30000;
 
-  // Trier par nombre d'erreurs
+  // rotation
   apiKeysStatus.sort((a, b) => a.errors - b.errors);
 
-  // On gardera la dernière erreur OpenRouter pour la renvoyer au frontend
-  let lastOpenRouterError = null;
+  let lastError = null;
 
   for (const keyObj of apiKeysStatus) {
     const { name, value } = keyObj;
 
-    // ✅ skip si clé vide
-    if (!value || typeof value !== "string" || value.trim() === "") {
-      console.warn(`⚠️ ${name} est vide/undefined dans les variables d'environnement (Render).`);
-      keyObj.errors += 1;
-      continue;
-    }
-
     try {
-      console.log(`🔑 Tentative avec ${name} | modèle=${model}`);
+      console.log(`🔑 OpenRouter via ${name} | model=${model}`);
 
       const response = await Promise.race([
         fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -62,15 +54,16 @@ app.post("/chat", async (req, res) => {
           headers: {
             Authorization: `Bearer ${value}`,
             "Content-Type": "application/json",
-
-            // ✅ Recommandé par OpenRouter
+            Accept: "application/json",
+            // Recommandés par OpenRouter (tracking / compat)
             "HTTP-Referer": "https://azizmalloul.com",
             "X-Title": "Aziz Chatbot",
           },
           body: JSON.stringify({
             model,
             messages,
-            temperature: 0.7,
+            temperature,
+            stream: false,
           }),
         }),
         new Promise((_, reject) =>
@@ -78,37 +71,43 @@ app.post("/chat", async (req, res) => {
         ),
       ]);
 
-      // ✅ Succès
+      const text = await response.text();
+
+      // tente parse JSON (succès ou erreur)
+      let payload = null;
+      try { payload = JSON.parse(text); } catch { payload = { raw: text }; }
+
       if (response.ok) {
-        const data = await response.json();
         keyObj.errors = 0;
-        return res.json(data);
+        return res.json(payload);
       }
 
-      // ❌ Erreur OpenRouter : log détaillé + stockage
-      const status = response.status;
-      const errorText = await response.text();
+      // Logs détaillés
+      console.warn(`❌ OpenRouter ${response.status} via ${name} :`, payload);
 
-      console.warn(`❌ OpenRouter ERROR | status=${status} | key=${name} | body=${errorText}`);
+      // Si modèle invalide (400), inutile de tester les autres clés
+      if (response.status === 400) {
+        return res.status(400).json({
+          error: "Erreur OpenRouter (model/payload). Vérifie l’ID du modèle.",
+          details: payload,
+        });
+      }
 
-      lastOpenRouterError = { status, key: name, body: errorText };
       keyObj.errors += 1;
+      lastError = { status: response.status, details: payload };
 
     } catch (err) {
-      console.error(`💥 Exception avec ${name} :`, err); // log complet
-      lastOpenRouterError = { status: 0, key: name, body: String(err?.message || err) };
+      console.error(`💥 Échec via ${name} :`, err.message);
       keyObj.errors += 1;
+      lastError = { status: 500, details: { message: err.message } };
     }
   }
 
-  // ✅ Renvoi d'une erreur utile au frontend
-  return res.status(502).json({
-    error: "❌ Toutes les clés ont échoué (OpenRouter).",
-    details: lastOpenRouterError,
+  return res.status(500).json({
+    error: "❌ Toutes les clés ont échoué (rate limit / clé invalide / provider down).",
+    details: lastError,
   });
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`✅ Serveur lancé sur le port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`✅ Serveur lancé sur le port ${PORT}`));
